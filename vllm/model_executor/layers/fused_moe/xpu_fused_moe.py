@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -21,6 +23,14 @@ from vllm.platforms import current_platform
 
 if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+    from vllm.model_executor.layers.fused_moe.xpu_fused_moe_triton import (
+        xpu_fused_moe_triton,
+    )
+
+
+def _use_triton_xpu_fused_moe() -> bool:
+    value = os.getenv("VLLM_XPU_FUSED_MOE_USE_TRITON", "0")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 class XPUExperts(mk.FusedMoEExpertsModular):
@@ -120,7 +130,9 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         topk = topk_ids.size(-1)
-        xpu_fused_moe(
+        fused_moe_impl = xpu_fused_moe_triton if _use_triton_xpu_fused_moe() \
+            else xpu_fused_moe
+        fused_moe_impl(
             hidden_states=hidden_states,
             w13=w1,
             w13_scales=self.w1_scale,

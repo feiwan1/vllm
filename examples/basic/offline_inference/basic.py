@@ -16,7 +16,8 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 def main():
     # Create an LLM.
-    llm = LLM(model="facebook/opt-125m")
+    #llm = LLM(model="facebook/opt-125m")
+    llm = LLM(model="/data0/Qwen3-30B-A3B/", tensor_parallel_size=4, gpu_memory_utilization=0.7, max_model_len=512)
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

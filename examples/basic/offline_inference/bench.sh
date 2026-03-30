@@ -15,11 +15,15 @@ GPU_MEMORY_UTILIZATION="0.8"
 
 export VLLM_XPU_FUSED_MOE_USE_TRITON=1
 #export VLLM_XPU_FUSED_MOE_USE_TRITON=1
+export TRITON_PRINT_AUTOTUNING=1
+
+#VLLM_XPU_FUSED_MOE_TRITON_TUNING_MODE=fixed
+VLLM_XPU_FUSED_MOE_TRITON_TUNING_MODE=autotune
 
 # 256 512 1024 2048 4096 8192 16384
-INPUT_LEN="2048"
-OUTPUT_LEN="8"
-NUM_PROMPTS="100"
+INPUT_LEN="256"
+OUTPUT_LEN="128"
+NUM_PROMPTS="32"
 MAX_CONCURRENCY="1"
 MAX_BATCH_SIZE="8"
 
@@ -81,6 +85,9 @@ vllm bench serve \
 	--input-len "${INPUT_LEN}" \
 	--output-len "${OUTPUT_LEN}" \
 	--max-concurrency "${MAX_CONCURRENCY}" \
-	--num-prompts "${NUM_PROMPTS}"
+	--num-prompts "${NUM_PROMPTS}" \
+	--save-result \
+	--save-detailed \
+	--result-dir ./bench_results
 	#--percentile-metrics ttft \
 	#--metric-percentiles 50,90,95,99

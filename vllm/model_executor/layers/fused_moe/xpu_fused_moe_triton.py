@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -39,11 +41,56 @@ XPU_TRITON_FUSED_MOE_AUTOTUNE_CONFIGS = [
     if not (block_size_n == 64 and nfused_n == 4)
 ]
 
+XPU_TRITON_FUSED_MOE_TUNING_MODE_ENV = (
+    "VLLM_XPU_FUSED_MOE_TRITON_TUNING_MODE"
+)
+XPU_TRITON_FUSED_MOE_FIXED_META_ENVS = {
+    "BLOCK_SIZE_N": "VLLM_XPU_FUSED_MOE_TRITON_BLOCK_SIZE_N",
+    "BLOCK_SIZE_K": "VLLM_XPU_FUSED_MOE_TRITON_BLOCK_SIZE_K",
+    "GROUP_SIZE_M": "VLLM_XPU_FUSED_MOE_TRITON_GROUP_SIZE_M",
+    "NFUSED_N": "VLLM_XPU_FUSED_MOE_TRITON_NFUSED_N",
+    "num_warps": "VLLM_XPU_FUSED_MOE_TRITON_NUM_WARPS",
+    "num_stages": "VLLM_XPU_FUSED_MOE_TRITON_NUM_STAGES",
+}
+XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META = {
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 32,
+    "NFUSED_N": 1,
+    "num_warps": 4,
+    "num_stages": 1,
+}
 
-@triton.autotune(configs=XPU_TRITON_FUSED_MOE_AUTOTUNE_CONFIGS,
-                 key=["N", "K", "EM"])
+
+def _get_xpu_triton_fused_moe_tuning_mode() -> str:
+    return os.getenv(XPU_TRITON_FUSED_MOE_TUNING_MODE_ENV,
+                     "autotune").strip().lower()
+
+
+def _get_xpu_triton_fused_moe_fixed_meta() -> dict[str, int]:
+    meta = XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META.copy()
+    for key, env_name in XPU_TRITON_FUSED_MOE_FIXED_META_ENVS.items():
+        value = os.getenv(env_name)
+        if value is not None:
+            meta[key] = int(value)
+
+    if (meta["BLOCK_SIZE_N"], meta["GROUP_SIZE_M"]) not in ((32, 32),
+                                                               (64, 16)):
+        raise ValueError(
+            "Unsupported fixed Triton MoE meta combination: "
+            f"BLOCK_SIZE_N={meta['BLOCK_SIZE_N']}, "
+            f"GROUP_SIZE_M={meta['GROUP_SIZE_M']}."
+        )
+    if meta["BLOCK_SIZE_N"] == 64 and meta["NFUSED_N"] == 4:
+        raise ValueError(
+            "Unsupported fixed Triton MoE meta combination: "
+            "BLOCK_SIZE_N=64 and NFUSED_N=4."
+        )
+    return meta
+
+
 @triton.jit
-def fused_moe_kernel(
+def _fused_moe_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
@@ -218,6 +265,11 @@ def fused_moe_kernel(
             tl.store(c_ptrs3, accumulator3, mask=c_mask3)
 
 
+fused_moe_kernel = triton.autotune(configs=XPU_TRITON_FUSED_MOE_AUTOTUNE_CONFIGS,
+                                   key=["N", "K", "EM"])(
+                                       _fused_moe_kernel)
+
+
 def _moe_align_block_size_triton(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -258,7 +310,7 @@ def _invoke_triton_fused_moe_kernel(
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"] * META["NFUSED_N"]),)
 
-    fused_moe_kernel[grid](
+    kernel_args = (
         A,
         B,
         C,
@@ -277,11 +329,30 @@ def _invoke_triton_fused_moe_kernel(
         B.stride(1),
         C.stride(1),
         C.stride(2),
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16,
-        BLOCK_SIZE_M=block_size_m,
     )
+    kernel_kwargs = {
+        "MUL_ROUTED_WEIGHT": mul_routed_weight,
+        "top_k": top_k,
+        "compute_type": tl.bfloat16
+        if A.dtype == torch.bfloat16 else tl.float16,
+        "BLOCK_SIZE_M": block_size_m,
+    }
+
+    if _get_xpu_triton_fused_moe_tuning_mode() == "fixed":
+        fixed_meta = _get_xpu_triton_fused_moe_fixed_meta()
+        _fused_moe_kernel[grid](
+            *kernel_args,
+            **kernel_kwargs,
+            BLOCK_SIZE_N=fixed_meta["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=fixed_meta["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=fixed_meta["GROUP_SIZE_M"],
+            NFUSED_N=fixed_meta["NFUSED_N"],
+            num_warps=fixed_meta["num_warps"],
+            num_stages=fixed_meta["num_stages"],
+        )
+        return
+
+    fused_moe_kernel[grid](*kernel_args, **kernel_kwargs)
 
 
 def xpu_fused_moe_triton(
@@ -305,6 +376,7 @@ def xpu_fused_moe_triton(
     is_int4: bool = False,
     is_mxfp4: bool = False,
 ) -> torch.Tensor:
+    #print("Running XPU fused MoE with Triton kernel")
     if output is None:
         output = torch.empty_like(hidden_states)
     else:

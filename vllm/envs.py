@@ -246,6 +246,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    VLLM_QWEN3_MOE_MAX_LOADED_LAYERS: int | None = None
 
 
 def get_default_cache_root():
@@ -396,6 +397,37 @@ def env_list_with_choices(
     return _get_validated_env_list
 
 
+def env_int_range(
+    env_name: str,
+    default: int | None,
+    min_value: int,
+    max_value: int,
+) -> Callable[[], int | None]:
+    """Create a lambda that validates an integer env var within a range."""
+
+    def _get_validated_env_int() -> int | None:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return default
+
+        try:
+            int_value = int(value)
+        except ValueError as err:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}. Must be an integer."
+            ) from err
+
+        if not min_value <= int_value <= max_value:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}. "
+                f"Valid range: [{min_value}, {max_value}]."
+            )
+
+        return int_value
+
+    return _get_validated_env_int
+
+
 def env_set_with_choices(
     env_name: str,
     default: list[str],
@@ -494,6 +526,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
+    # If set, skip loading Qwen3-MoE checkpoint expert weights whose layer
+    # index is >= this value. Intended for truncated checkpoints/configs.
+    "VLLM_QWEN3_MOE_MAX_LOADED_LAYERS": env_int_range(
+        "VLLM_QWEN3_MOE_MAX_LOADED_LAYERS", None, 1, 94
+    ),
     # If set, vllm will use precompiled binaries (*.so)
     "VLLM_USE_PRECOMPILED": lambda: os.environ.get("VLLM_USE_PRECOMPILED", "")
     .strip()

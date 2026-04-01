@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -32,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -84,6 +86,20 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_QWEN3_MOE_LAYER_NAME_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def _should_skip_extra_expert_key(name: str) -> bool:
+    max_loaded_layers = envs.VLLM_QWEN3_MOE_MAX_LOADED_LAYERS
+    if max_loaded_layers is None:
+        return False
+
+    match = _QWEN3_MOE_LAYER_NAME_RE.search(name)
+    if match is None:
+        return False
+
+    return int(match.group(1)) >= max_loaded_layers
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -626,6 +642,11 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
                         and name_mapped not in params_dict
                     ):
                         continue
+
+                    if name_mapped not in params_dict:
+                        if _should_skip_extra_expert_key(name_mapped):
+                            continue
+                        raise KeyError(name_mapped)
 
                     param = params_dict[name_mapped]
                     # We should ask the weight loader to return success or not

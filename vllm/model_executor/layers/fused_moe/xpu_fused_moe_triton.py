@@ -10,9 +10,9 @@ import triton.language as tl
 from vllm import _custom_ops as ops
 
 XPU_TRITON_FUSED_MOE_AUTOTUNE_PARAM_SPACE = {
-    "BLOCK_SIZE_N": [32, 64, 128],
-    "BLOCK_SIZE_K": [32, 64, 128],
-    "GROUP_SIZE_M": [16, 32],
+    "BLOCK_SIZE_N": [16, 32, 64],
+    "BLOCK_SIZE_K": [16, 32, 64],
+    "GROUP_SIZE_M": [16, 32, 64],
     "NFUSED_N": [1, 2, 4],
 }
 
@@ -53,13 +53,57 @@ XPU_TRITON_FUSED_MOE_FIXED_META_ENVS = {
     "num_stages": "VLLM_XPU_FUSED_MOE_TRITON_NUM_STAGES",
 }
 XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META = {
-    "BLOCK_SIZE_N": 32,
-    "BLOCK_SIZE_K": 32,
-    "GROUP_SIZE_M": 32,
+    "BLOCK_SIZE_N": 16,
+    "BLOCK_SIZE_K": 16,
+    "GROUP_SIZE_M": 16,
     "NFUSED_N": 1,
-    "num_warps": 4,
+    "num_warps": 1,
     "num_stages": 1,
 }
+
+# num_tokens, K
+XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META_TIERS = (
+    ((256, 2048), {
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 16,
+        "NFUSED_N": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+    }),
+    ((256, 192), {
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 32,
+        "NFUSED_N": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }),
+    ((1, 2048), {
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 16,
+        "GROUP_SIZE_M": 16,
+        "NFUSED_N": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }),
+    ((1, 192), {
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 16,
+        "GROUP_SIZE_M": 16,
+        "NFUSED_N": 1,
+        "num_warps": 4,
+        "num_stages": 1,
+    }),
+    ((None, None), {
+        "BLOCK_SIZE_N": 16,
+        "BLOCK_SIZE_K": 16,
+        "GROUP_SIZE_M": 16,
+        "NFUSED_N": 1,
+        "num_warps": 1,
+        "num_stages": 1,
+    }),
+)
 
 
 def _get_xpu_triton_fused_moe_tuning_mode() -> str:
@@ -67,25 +111,45 @@ def _get_xpu_triton_fused_moe_tuning_mode() -> str:
                      "autotune").strip().lower()
 
 
-def _get_xpu_triton_fused_moe_fixed_meta() -> dict[str, int]:
-    meta = XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META.copy()
+def _validate_xpu_triton_fused_moe_fixed_meta(meta: dict[str, int]) -> None:
+    for key, env_name in XPU_TRITON_FUSED_MOE_FIXED_META_ENVS.items():
+        if key not in meta:
+            raise ValueError(f"Missing fixed Triton MoE meta key: {key}.")
+
+
+def _has_xpu_triton_fused_moe_fixed_meta_override() -> bool:
+    return any(os.getenv(env_name) is not None
+               for env_name in XPU_TRITON_FUSED_MOE_FIXED_META_ENVS.values())
+
+
+def _get_xpu_triton_fused_moe_default_fixed_meta(
+    num_tokens: int,
+    k: int,
+) -> dict[str, int]:
+    for (tier_num_tokens, tier_k), meta in \
+            XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META_TIERS:
+        token_match = (tier_num_tokens is None or num_tokens == tier_num_tokens)
+        k_match = (tier_k is None or k == tier_k)
+        if token_match and k_match:
+            return meta.copy()
+    return XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META.copy()
+
+
+def _get_xpu_triton_fused_moe_fixed_meta(
+    num_tokens: int,
+    k: int,
+) -> dict[str, int]:
+    meta = _get_xpu_triton_fused_moe_default_fixed_meta(num_tokens, k)
+    if not _has_xpu_triton_fused_moe_fixed_meta_override():
+        _validate_xpu_triton_fused_moe_fixed_meta(meta)
+        return meta
+
     for key, env_name in XPU_TRITON_FUSED_MOE_FIXED_META_ENVS.items():
         value = os.getenv(env_name)
         if value is not None:
             meta[key] = int(value)
 
-    if (meta["BLOCK_SIZE_N"], meta["GROUP_SIZE_M"]) not in ((32, 32),
-                                                               (64, 16)):
-        raise ValueError(
-            "Unsupported fixed Triton MoE meta combination: "
-            f"BLOCK_SIZE_N={meta['BLOCK_SIZE_N']}, "
-            f"GROUP_SIZE_M={meta['GROUP_SIZE_M']}."
-        )
-    if meta["BLOCK_SIZE_N"] == 64 and meta["NFUSED_N"] == 4:
-        raise ValueError(
-            "Unsupported fixed Triton MoE meta combination: "
-            "BLOCK_SIZE_N=64 and NFUSED_N=4."
-        )
+    _validate_xpu_triton_fused_moe_fixed_meta(meta)
     return meta
 
 
@@ -339,7 +403,20 @@ def _invoke_triton_fused_moe_kernel(
     }
 
     if _get_xpu_triton_fused_moe_tuning_mode() == "fixed":
-        fixed_meta = _get_xpu_triton_fused_moe_fixed_meta()
+        fixed_meta = _get_xpu_triton_fused_moe_fixed_meta(topk_ids.shape[0],
+                                                          B.shape[2])
+        """
+        print(
+            "[xpu_fused_moe_triton] fixed meta selected: "
+            f"num_tokens={topk_ids.shape[0]}, K={B.shape[2]}, "
+            f"BLOCK_SIZE_N={fixed_meta['BLOCK_SIZE_N']}, "
+            f"BLOCK_SIZE_K={fixed_meta['BLOCK_SIZE_K']}, "
+            f"GROUP_SIZE_M={fixed_meta['GROUP_SIZE_M']}, "
+            f"NFUSED_N={fixed_meta['NFUSED_N']}, "
+            f"num_warps={fixed_meta['num_warps']}, "
+            f"num_stages={fixed_meta['num_stages']}"
+        )
+        """
         _fused_moe_kernel[grid](
             *kernel_args,
             **kernel_kwargs,
@@ -418,7 +495,10 @@ def xpu_fused_moe_triton(
     if not topk_weights.is_contiguous():
         topk_weights = topk_weights.contiguous()
 
-    block_size_m = 16 if num_rows <= num_experts else 64
+    if num_rows == 1:
+        block_size_m = 1
+    else:
+        block_size_m = 16 if num_rows <= num_experts else 64
 
     gemm1_output = torch.empty((num_rows, n_experts_per_token, 2 * inter_size),
                                dtype=hidden_states.dtype,

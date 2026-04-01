@@ -130,6 +130,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         topk = topk_ids.size(-1)
+        #print("[xpu_fused_moe] hidden_states shape=", tuple(hidden_states.shape), "num_tokens=", hidden_states.shape[0], "topk=", topk)
         fused_moe_impl = xpu_fused_moe_triton if _use_triton_xpu_fused_moe() \
             else xpu_fused_moe
         fused_moe_impl(

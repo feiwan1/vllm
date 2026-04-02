@@ -75,7 +75,7 @@ XPU_TRITON_FUSED_MOE_DEFAULT_FIXED_META_TIERS = (
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 1,
-        "NFUSED_N": 4,
+        "NFUSED_N": 1,
         "num_warps": 8,
         "num_stages": 2,
     }),
